@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/joho/godotenv"
 )
@@ -109,89 +110,76 @@ type jsonLogin struct {
 	Pass string `json:"pwd"`
 }
 
-var Api = struct {
-	url     string
-	token   string
-	login   string
-	flights string
-}{
-	url:     "https://de.dhv-xc.de/api/",
-	token:   "xc/login/status",
-	login:   "xc/login/login",
-	flights: "fli/flights",
-}
-var Method = struct {
-	GET  string
-	POST string
-}{
-	GET:  "GET",
-	POST: "POST",
-}
+const (
+	baseURL = "https://de.dhv-xc.de/api/"
+)
 
-var client http.Client
-var token string
+var (
+	api = struct {
+		url     string
+		token   string
+		login   string
+		flights string
+	}{
+		url:     baseURL,
+		token:   "xc/login/status",
+		login:   "xc/login/login",
+		flights: "fli/flights",
+	}
+	method = struct {
+		GET, POST string
+	}{
+		GET:  "GET",
+		POST: "POST",
+	}
+	client http.Client
+	token  string
+)
 
 func init() {
-	_, ok := os.LookupEnv("XC_DEBUG")
-	if ok {
+	if os.Getenv("XC_DEBUG") == "true" {
 		log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	} else {
 		log.SetFlags(log.Ldate | log.Ltime)
 	}
+
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		log.Fatalf("Got error while creating cookie jar %s", err.Error())
+		log.Fatalf("Failed to create cookie jar: %v", err)
 	}
 	client = http.Client{Jar: jar}
 }
 
-func json_dumps(data interface{}) []byte {
-	payload, err := json.Marshal(data)
+func jsonMarshal(v interface{}) []byte {
+	data, err := json.Marshal(v)
 	if err != nil {
-		log.Printf("ERROR: Cant dump json response: %v", err)
-		log.Fatal(err)
+		log.Fatalf("JSON marshal error: %v", err)
 	}
-	return payload
+	return data
 }
 
-func json_load(data []byte) map[string]interface{} {
-	var result map[string]interface{}
-	err := json.Unmarshal([]byte(data), &result)
-	if err != nil {
-		log.Printf("ERROR: Cant load json response: %v", err)
-		log.Fatal(err)
+func jsonUnmarshal[T any](data []byte) T {
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
+		log.Fatalf("JSON unmarshal error: %v", err)
 	}
 	return result
 }
 
-func unmarshalFlightResponse(data []byte) FlightResponse {
-	var resp FlightResponse
-	err := json.Unmarshal([]byte(data), &resp)
+func httpReq(url string, payload []byte, method string, token string) []byte {
+	req, _ := http.NewRequest(method, url, bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	if token != "" {
+		req.Header.Set("X-CSRF-Token", token)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("ERROR: Cant load json response: %v", err)
 		log.Fatal(err)
 	}
-	return resp
-}
+	defer resp.Body.Close()
 
-func httpReq(url string, payload []byte, method string, token string) []byte {
-	var request *http.Request
-	if method == Method.POST {
-		request, _ = http.NewRequest(method, url, bytes.NewBuffer(payload))
-	} else {
-		request, _ = http.NewRequest(method, url, nil)
-	}
-	request.Header.Set("Content-Type", "application/json; charset=UTF-8")
-
-	if token != "" {
-		request.Header.Set("X-CSRF-Token", token)
-	}
-	response, error := client.Do(request)
-	if error != nil {
-		log.Fatal(error)
-	}
-	body, _ := io.ReadAll(response.Body)
-
+	body, _ := io.ReadAll(resp.Body)
 	return body
 }
 
@@ -203,72 +191,66 @@ func success(resp map[string]interface{}) bool {
 }
 
 func getToken(data jsonLogin) string {
-	body := httpReq(Api.url+Api.token, json_dumps(data), Method.GET, "")
-	resp := json_load(body)
-	if !success(resp) {
-		log.Fatalf("Unable to get token: [%s]", resp["message"])
+	body := httpReq(api.url+api.token, jsonMarshal(data), method.GET, "")
+	resp := jsonUnmarshal[map[string]interface{}](body)
+
+	if success, ok := resp["success"].(bool); !ok || !success {
+		log.Fatalf("Unable to get token: %v", resp["message"])
 	}
-	log.Printf("DEBUG: %v", resp)
+
 	meta := resp["meta"].(map[string]interface{})
-	log.Printf("DEBUG: %v", meta["token"])
 	return fmt.Sprintf("%v", meta["token"])
 }
 
 func saveIgc(id string, targetdir string) int {
 	igcurl := fmt.Sprintf("https://en.dhv-xc.de/flight/%s/igc", id)
-	igcdata := httpReq(igcurl, json_dumps(""), Method.GET, token)
-	f, _ := os.Create(fmt.Sprintf("%s/%s.igc", targetdir, id))
-	log.Printf("INFO: Saving flight: [%s] to: [%s/%s.igc]", id, targetdir, id)
-	f.Write(igcdata)
-	f.Close()
+	igcdata := httpReq(igcurl, jsonMarshal(""), method.GET, token)
+
+	filename := fmt.Sprintf("%s/%s.igc", targetdir, id)
+	if err := os.WriteFile(filename, igcdata, 0644); err != nil {
+		log.Printf("ERROR: Failed to save IGC file: %v", err)
+		return 0
+	}
+
+	log.Printf("INFO: Saved flight: [%s] to: [%s]", id, filename)
 	return 1
 }
 
 func saveJson(flight Flight, id string, targetdir string) {
-	jsonData, err := json.MarshalIndent(flight, "", "    ")
-	if err != nil {
-		log.Printf("ERROR: Failed to marshal flight data: %v", err)
-		return
-	}
-
 	filename := fmt.Sprintf("%s/%s.json", targetdir, id)
-	err = os.WriteFile(filename, jsonData, 0644)
-	if err != nil {
-		log.Printf("ERROR: Failed to write JSON file: %v", err)
+	if err := os.WriteFile(filename, jsonMarshal(flight), 0644); err != nil {
+		log.Printf("ERROR: Failed to save JSON file: %v", err)
 		return
 	}
-
 	log.Printf("INFO: Saved flight JSON to: %s", filename)
 }
 
 func makedir(path string) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.Mkdir(path, 0755); os.IsNotExist(err) {
-			log.Fatalf("Unable to create target dir: [%s]", err)
-		}
+	if err := os.MkdirAll(path, 0755); err != nil {
+		log.Fatalf("Failed to create directory %s: %v", path, err)
 	}
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 
-	var outputDir = "data"
+	outputDir := "data"
 	makedir(outputDir)
 
-	data := jsonLogin{
+	loginData := jsonLogin{
 		User: os.Getenv("XC_USER"),
 		Pass: os.Getenv("XC_PASS"),
 	}
 
-	token = getToken(data)
+	token = getToken(loginData)
 	log.Printf("INFO: Got token: [%s]", token)
-	body := httpReq(Api.url+Api.login, json_dumps(data), Method.POST, token)
-	resp := json_load(body)
+
+	body := httpReq(api.url+api.login, jsonMarshal(loginData), method.POST, token)
+	resp := jsonUnmarshal[map[string]interface{}](body)
 	if !success(resp) {
-		log.Fatalf("Authentication failed: [%s]", resp["message"])
+		log.Fatalf("Authentication failed: %v", resp["message"])
 	}
 	log.Printf("INFO: Logged in")
 
@@ -276,19 +258,22 @@ func main() {
 
 	log.Printf("INFO: %s", requestUrl)
 
-	bodyp := httpReq(requestUrl, json_dumps(data), Method.GET, token)
-	flights := unmarshalFlightResponse(bodyp)
+	flights := jsonUnmarshal[FlightResponse](httpReq(requestUrl, jsonMarshal(loginData), method.GET, token))
 	var wg sync.WaitGroup
-	var saved int = 0
-	for i := 0; i < len(flights.Data); i++ {
-		saveJson(flights.Data[i], flights.Data[i].IDFlight, outputDir)
+	var saved int32
+
+	for _, flight := range flights.Data {
+		saveJson(flight, flight.IDFlight, outputDir)
 
 		wg.Add(1)
-		go func(id string, date string) {
+		go func(id string) {
 			defer wg.Done()
-			saved += saveIgc(id, outputDir)
-		}(flights.Data[i].IDFlight, flights.Data[i].FlightDate)
+			if saveIgc(id, outputDir) == 1 {
+				atomic.AddInt32(&saved, 1)
+			}
+		}(flight.IDFlight)
 	}
+
 	wg.Wait()
 	log.Printf("INFO: Saved [%d] flights", saved)
 }

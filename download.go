@@ -193,7 +193,10 @@ func httpReq(url string, payload []byte, method string, token string) []byte {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response body: %v", err)
+	}
 	return body
 }
 
@@ -344,7 +347,7 @@ func main() {
 	//  As of 18.03.2025, there are 91122 flights in the database, no need to worry for the older ones
 	totalFlights := 91122
 
-	for start := 13500; start < totalFlights; start += 500 {
+	for start := 0; start < totalFlights; start += 500 {
 		navParameters["start"] = start
 
 		// Construct the full URL for this batch
@@ -380,7 +383,6 @@ func main() {
 		}
 
 		wg.Wait()
-		log.Printf("INFO: Saved [%d] flights", saved)
 
 		log.Printf("INFO: Sleeping for 200 ms, currently at %d", start)
 		time.Sleep(5000 * time.Millisecond)
